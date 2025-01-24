@@ -241,8 +241,8 @@ def ask_ollama(prompt: str, model: str = OLLAMA_MODEL) -> str:
 # =========================
 
 class OllamaTool(BaseTool):
-    name = "ollama_tool"
-    description = "Call the local Ollama LLM for generation."
+    name: str = "ollama_tool"
+    description: str = "Call the local Ollama LLM for generation."
 
     def _run(self, prompt: str) -> str:
         return ask_ollama(prompt)
@@ -251,8 +251,8 @@ class OllamaTool(BaseTool):
         return self._run(prompt)
 
 class ChatGPTTool(BaseTool):
-    name = "chatgpt_tool"
-    description = "Call the ChatGPT API for additional external info."
+    name: str = "chatgpt_tool"
+    description: str = "Call the ChatGPT API for additional external info."
 
     def _run(self, prompt: str) -> str:
         system_prompt = "You are a concise, helpful AI. Provide the best factual answer."
