@@ -1,8 +1,22 @@
+import streamlit as st
 import sqlite3
 import requests
 import os
-from typing import Optional, List, Dict, Any
+import json
 
+import faiss
+import numpy as np
+
+# -----------------------------
+# Hugging Face Embeddings
+# -----------------------------
+from sentence_transformers import SentenceTransformer
+
+# -----------------------------
+# LangChain (for orchestration)
+# -----------------------------
+from langchain.schema import Document
+from langchain.tools import BaseTool
 
 # =========================
 # CONFIGURATION
@@ -10,24 +24,36 @@ from typing import Optional, List, Dict, Any
 
 DATABASE_FILE = "my_local_data.db"
 
-# NOTE: You must set your ChatGPT API key in an environment variable:
-#       export OPENAI_API_KEY="your-key-here"
+# ChatGPT
 CHATGPT_API_KEY = os.environ.get("OPENAI_API_KEY", "")
-
-# Default endpoints (adjust as needed)
 CHATGPT_API_URL = "https://api.openai.com/v1/chat/completions"
-OLLAMA_API_URL = "http://localhost:11411"  # Default Ollama server endpoint
+
+# Ollama
+OLLAMA_API_URL = "http://localhost:11411"
+OLLAMA_MODEL   = "llama2"  # Adjust to whichever model you have in Ollama (e.g., "llama2", "mistral", etc.)
+
+# Embedding model name (Hugging Face)
+EMBEDDING_MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
+
+# Initialize the embedding model once
+embedding_model = SentenceTransformer(EMBEDDING_MODEL_NAME)
+
+# Global reference to FAISS index
+faiss_index = None
+dimension = 384  # all-MiniLM-L6-v2 outputs 384-dimensional embeddings
+faiss_index_file = "my_faiss.index"  # store to disk if you want persistence
 
 
 # =========================
-# 1. DATABASE OPERATIONS
+# 1. DATABASE & FAISS INIT
 # =========================
 
 def init_db():
     """
-    Initialize (or connect to) the local SQLite database.
-    Creates tables if not existing.
+    1) Initialize/connect to the local SQLite database.
+    2) Initialize or load a FAISS index for vector search.
     """
+    # SQLite for document text & metadata
     conn = sqlite3.connect(DATABASE_FILE)
     cursor = conn.cursor()
     cursor.execute("""
@@ -41,92 +67,123 @@ def init_db():
     conn.commit()
     conn.close()
 
+    # Create or load FAISS index
+    global faiss_index
+    if os.path.exists(faiss_index_file):
+        # Load existing index
+        faiss_index = faiss.read_index(faiss_index_file)
+    else:
+        # Create a new index (flat L2)
+        faiss_index = faiss.IndexFlatL2(dimension)
 
-def add_document(content: str, is_sensitive: bool = False, metadata: Optional[str] = None):
+def save_faiss_index():
+    """ Save the in-memory FAISS index to disk (if desired). """
+    if faiss_index is not None:
+        faiss.write_index(faiss_index, faiss_index_file)
+
+def add_document(content: str, is_sensitive: bool = False, metadata: str = ""):
     """
-    Insert a document into the local database.
+    Insert a document (plus metadata) into SQLite, then embed & add to FAISS.
     """
+    # 1) Insert into SQLite
     conn = sqlite3.connect(DATABASE_FILE)
     cursor = conn.cursor()
     cursor.execute("""
         INSERT INTO documents (content, is_sensitive, metadata)
         VALUES (?, ?, ?)
     """, (content, 1 if is_sensitive else 0, metadata))
+    doc_id = cursor.lastrowid
     conn.commit()
     conn.close()
 
+    # 2) Embed and add to FAISS
+    global faiss_index
+    embedding = embedding_model.encode(content).astype(np.float32).reshape(1, -1)
 
-def retrieve_all_documents() -> List[Dict[str, Any]]:
+    # If not an IDMap, convert it so we can track doc_id
+    if not isinstance(faiss_index, faiss.IndexIDMap):
+        index_idmap = faiss.IndexIDMap(faiss_index)
+        faiss_index = index_idmap
+
+    # Add vector with the doc ID
+    faiss_index.add_with_ids(embedding, np.array([doc_id], dtype=np.int64))
+    save_faiss_index()
+
+def retrieve_all_documents():
     """
-    Return all documents from the local database.
+    Return all docs from SQLite as a list of dicts.
     """
     conn = sqlite3.connect(DATABASE_FILE)
     cursor = conn.cursor()
-    cursor.execute("SELECT content, is_sensitive, metadata FROM documents")
+    cursor.execute("SELECT id, content, is_sensitive, metadata FROM documents")
     rows = cursor.fetchall()
     conn.close()
 
     docs = []
     for row in rows:
-        doc_content, doc_sens, doc_meta = row
+        doc_id, content, sens, meta = row
         docs.append({
-            "content": doc_content,
-            "is_sensitive": bool(doc_sens),
-            "metadata": doc_meta
+            "id": doc_id,
+            "content": content,
+            "is_sensitive": bool(sens),
+            "metadata": meta
         })
     return docs
 
+def retrieve_relevant_docs(query: str, top_k: int = 3):
+    """
+    Use FAISS to return top_k relevant documents to the query (via vector similarity).
+    """
+    if not faiss_index:
+        return []
 
-def retrieve_relevant_docs(query: str) -> List[Dict[str, Any]]:
-    """
-    Very naive text-based retrieval: checks if query is a substring of a doc.
-    In production, you'd use embeddings + a vector store (FAISS, Chroma, etc.).
-    """
+    # Embed query
+    query_vec = embedding_model.encode(query).astype(np.float32).reshape(1, -1)
+    distances, indices = faiss_index.search(query_vec, top_k)
+
+    # If no results or an empty index, return []
+    if len(indices) == 0 or indices[0][0] == -1:
+        return []
+
+    # Fetch from DB
     conn = sqlite3.connect(DATABASE_FILE)
     cursor = conn.cursor()
-    # Let's just fetch all docs and do naive filter in Python
-    cursor.execute("SELECT content, is_sensitive, metadata FROM documents")
-    rows = cursor.fetchall()
-    conn.close()
 
-    relevant = []
-    query_lower = query.lower()
-    for row in rows:
-        doc_content, doc_sens, doc_meta = row
-        if query_lower in doc_content.lower():
-            relevant.append({
+    results = []
+    for idx, dist in zip(indices[0], distances[0]):
+        if idx == -1:
+            continue
+        cursor.execute("SELECT id, content, is_sensitive, metadata FROM documents WHERE id=?", (idx,))
+        row = cursor.fetchone()
+        if row:
+            doc_id, doc_content, doc_sens, doc_meta = row
+            results.append({
+                "id": doc_id,
                 "content": doc_content,
                 "is_sensitive": bool(doc_sens),
-                "metadata": doc_meta
+                "metadata": doc_meta,
+                "distance": dist
             })
-    return relevant
+
+    conn.close()
+    return results
 
 
 # =========================
-# 2. CHATGPT API CALL
+# 2. ChatGPT Fallback
 # =========================
 
-def ask_chatgpt(
-    system_prompt: str,
-    user_prompt: str,
-    model: str = "gpt-3.5-turbo"
-) -> str:
+def ask_chatgpt(system_prompt: str, user_prompt: str, model: str = "gpt-3.5-turbo") -> str:
     """
-    Securely call ChatGPT's API, ensuring no sensitive data is sent.
-    - system_prompt: instructions for ChatGPT's system role
-    - user_prompt: the minimal user question or text needed
-    - model: the ChatGPT model name (e.g., gpt-3.5-turbo, gpt-4, etc.)
-
-    Returns the text response from ChatGPT.
+    Call OpenAI ChatGPT to get external info if local docs insufficient.
     """
     if not CHATGPT_API_KEY:
-        raise ValueError("Missing ChatGPT API key. Please set OPENAI_API_KEY environment variable.")
+        return "Error: Missing OPENAI_API_KEY environment variable."
 
     headers = {
         "Content-Type": "application/json",
         "Authorization": f"Bearer {CHATGPT_API_KEY}",
     }
-
     body = {
         "model": model,
         "messages": [
@@ -136,24 +193,23 @@ def ask_chatgpt(
         "temperature": 0.7
     }
 
-    response = requests.post(CHATGPT_API_URL, headers=headers, json=body, timeout=60)
-    response_json = response.json()
-
-    # Handle any errors
-    if "error" in response_json:
-        raise ValueError(f"ChatGPT API error: {response_json['error']}")
-
-    return response_json["choices"][0]["message"]["content"]
+    try:
+        resp = requests.post(CHATGPT_API_URL, headers=headers, json=body, timeout=60)
+        resp_json = resp.json()
+        if "error" in resp_json:
+            return f"ChatGPT API error: {resp_json['error']}"
+        return resp_json["choices"][0]["message"]["content"]
+    except Exception as e:
+        return f"Error calling ChatGPT: {e}"
 
 
 # =========================
-# 3. OLLAMA (LOCAL LLM) API
+# 3. Ollama (Local LLM)
 # =========================
 
-def ask_ollama(prompt: str, model: str = "llama2") -> str:
+def ask_ollama(prompt: str, model: str = OLLAMA_MODEL) -> str:
     """
-    Send a prompt to a local Ollama server (e.g., 'llama2' model).
-    Make sure Ollama is installed and running: https://github.com/jmorganca/ollama
+    Use Ollama with a local LLM (like Llama 2, Mistral, Qwen, etc.).
     """
     req_body = {
         "prompt": prompt,
@@ -163,7 +219,6 @@ def ask_ollama(prompt: str, model: str = "llama2") -> str:
             "temperature": 0.2
         }
     }
-
     try:
         response = requests.post(url=f"{OLLAMA_API_URL}/generate", json=req_body, stream=True)
         if response.status_code != 200:
@@ -171,7 +226,6 @@ def ask_ollama(prompt: str, model: str = "llama2") -> str:
         full_text = ""
         for chunk in response.iter_lines(decode_unicode=True):
             if chunk:
-                import json
                 data = json.loads(chunk)
                 if "response" in data:
                     full_text += data["response"]
@@ -183,144 +237,147 @@ def ask_ollama(prompt: str, model: str = "llama2") -> str:
 
 
 # =========================
-# 4. CORE Q&A LOGIC
+# 4. LangChain Tools
+# =========================
+
+class OllamaTool(BaseTool):
+    name = "ollama_tool"
+    description = "Call the local Ollama LLM for generation."
+
+    def _run(self, prompt: str) -> str:
+        return ask_ollama(prompt)
+
+    async def _arun(self, prompt: str) -> str:
+        return self._run(prompt)
+
+class ChatGPTTool(BaseTool):
+    name = "chatgpt_tool"
+    description = "Call the ChatGPT API for additional external info."
+
+    def _run(self, prompt: str) -> str:
+        system_prompt = "You are a concise, helpful AI. Provide the best factual answer."
+        return ask_chatgpt(system_prompt, prompt)
+
+    async def _arun(self, prompt: str) -> str:
+        return self._run(prompt)
+
+ollama_tool = OllamaTool()
+chatgpt_tool = ChatGPTTool()
+
+
+# =========================
+# 5. CORE Q&A LOGIC
 # =========================
 
 def process_user_question(question: str) -> str:
     """
-    Main Q&A function:
-    1) Retrieve relevant documents from the local DB.
-    2) Split them into sensitive vs. non-sensitive sets.
-    3) Check if local docs likely answer the question (naive approach).
-       - If yes, ask Ollama directly with local context.
-       - If no, or if the question references something we don't have,
-         ask ChatGPT for the missing info (without sending any sensitive data).
-    4) Combine ChatGPT's new info (if any) with local sensitive data
-       and ask Ollama for the final answer.
+    1) Get top_k relevant docs from FAISS + DB.
+    2) If local docs suffice, use them.
+    3) If not, call ChatGPT for external info.
+    4) Combine local + external, finalize with Ollama.
     """
+    # Retrieve relevant docs
+    relevant_docs = retrieve_relevant_docs(question, top_k=3)
+    if not relevant_docs:
+        # No local docs at all -> fallback to ChatGPT
+        external_info = chatgpt_tool.run(question)
+        prompt_for_ollama = f"""
+No local docs found.
 
-    # Step 1: Find relevant local docs
-    relevant_docs = retrieve_relevant_docs(question)
-    sensitive_docs = [d for d in relevant_docs if d["is_sensitive"]]
-    non_sensitive_docs = [d for d in relevant_docs if not d["is_sensitive"]]
-
-    # Combine docs into text blocks
-    combined_non_sensitive_context = "\n".join([doc["content"] for doc in non_sensitive_docs])
-    combined_sensitive_context = "\n".join([doc["content"] for doc in sensitive_docs])
-
-    # Step 2: Decide if local docs are enough
-    # For demonstration, let's do a naive check:
-    # "If we found any relevant docs, let's guess they might answer the question."
-    # But we also consider if the question might be about "new" or "unknown" data.
-    # In real usage, you'd have a more robust method (embedding similarity, etc.).
-    local_info_sufficient = False
-    if len(relevant_docs) > 0:
-        # Naive assumption: if we found something, let's consider it "potentially sufficient"
-        # unless user question hints at new data (like "latest", "recent", "current", "today", etc.).
-        # You can expand this logic as needed.
-        lower_q = question.lower()
-        # If we see certain keywords, we guess user wants new info not in the local DB.
-        if any(k in lower_q for k in ["latest", "current", "today", "recent", "live"]):
-            local_info_sufficient = False
-        else:
-            local_info_sufficient = True
-
-    # Step 3: If local info is sufficient, ask Ollama with local context
-    if local_info_sufficient:
-        ollama_prompt = f"""
-You have the following local context (non-sensitive):
-{combined_non_sensitive_context}
-
-You also have sensitive context, which you MUST NOT reveal to the user:
-{combined_sensitive_context}
-
-User's question: {question}
-
-Using ONLY the local context above, please answer the user's question. 
-Do not reveal or leak sensitive data. 
-If the user question is fully answered by local data, answer it carefully.
-"""
-        ollama_answer = ask_ollama(ollama_prompt)
-        return ollama_answer.strip()
-
-    # Step 4: If local info is NOT sufficient, we ask ChatGPT for the missing piece
-    # WITHOUT sending any sensitive data. In a real scenario, you'd parse or analyze
-    # the question to see exactly what you need from ChatGPT. Here, we simply pass
-    # the entire question as "lack of local data" scenario, but we won't attach
-    # the sensitive docs to ChatGPT.
-    try:
-        # Minimal system prompt to remind GPT to respond concisely
-        system_prompt = (
-            "You are a helpful, concise assistant. Provide the best available factual answer. "
-            "Do NOT include any personal or private data in your response."
-        )
-        # We pass only the user question that presumably doesn't contain
-        # sensitive data. If the user question itself had sensitive data,
-        # you would need to sanitize it here (not shown).
-        chatgpt_response = ask_chatgpt(system_prompt, question)
-    except Exception as e:
-        return f"Error calling ChatGPT for external info: {e}"
-
-    # Step 5: Now we have ChatGPT's answer (which presumably includes the missing data).
-    # Combine it with any local sensitive data that might be relevant, then
-    # let Ollama produce the final user-facing answer.
-    final_prompt = f"""
-Local non-sensitive context:
-{combined_non_sensitive_context}
-
-Sensitive context (not to be revealed):
-{combined_sensitive_context}
-
-New external info from ChatGPT (to help answer the question):
-{chatgpt_response}
+External info from ChatGPT:
+{external_info}
 
 User question: {question}
 
-Now combine the local context (including sensitive data internally), 
-and the new external info from ChatGPT. Produce a final answer for the user. 
-DO NOT reveal or leak the sensitive data from local context.
+Provide an answer (do not invent personal data).
 """
-    final_answer = ask_ollama(final_prompt)
-    return final_answer.strip()
+        return ollama_tool.run(prompt_for_ollama).strip()
+
+    # We do have local docs
+    # Separate sensitive vs. non-sensitive
+    sensitive_docs = [d for d in relevant_docs if d["is_sensitive"]]
+    non_sensitive_docs = [d for d in relevant_docs if not d["is_sensitive"]]
+
+    combined_non_sensitive = "\n".join([d["content"] for d in non_sensitive_docs])
+    combined_sensitive = "\n".join([d["content"] for d in sensitive_docs])
+
+    # Decide if local docs are enough
+    local_info_sufficient = True
+    lower_q = question.lower()
+    if any(k in lower_q for k in ["latest", "current", "today", "recent", "live"]):
+        local_info_sufficient = False
+
+    external_info = ""
+    if not local_info_sufficient:
+        external_info = chatgpt_tool.run(question)
+        # If there's an error or empty, it's just an empty string
+
+    # Combine everything for final prompt
+    prompt_for_ollama = f"""
+Local non-sensitive docs:
+{combined_non_sensitive}
+
+Local sensitive docs (DO NOT REVEAL to user):
+{combined_sensitive}
+
+External info from ChatGPT (if any):
+{external_info}
+
+User question: {question}
+
+Using all the info above, provide a final answer without leaking sensitive data.
+"""
+    return ollama_tool.run(prompt_for_ollama).strip()
 
 
 # =========================
-# 5. DEMO / MAIN
+# 6. STREAMLIT FRONTEND
 # =========================
 
-if __name__ == "__main__":
-    # Make sure our local DB is initialized
+def main():
+    # Initialize DB & FAISS
     init_db()
 
-    # (Optional) Add some sample documents:
-    # -- Run once to populate, or wrap in if not exists checks, etc. --
-    # NOTE: In real usage, do this only once, or have a separate script to ingest data.
+    st.title("Open Source AI Stack Demo")
+    st.markdown("""
+**Technologies used**:
+- **Streamlit** (UI)
+- **SQLite** (local DB for docs)
+- **FAISS** (vector store)
+- **Hugging Face** embeddings
+- **LangChain** (tools orchestration)
+- **Ollama** (local LLM)
+- **ChatGPT** (fallback for external knowledge)
+""")
 
-    # Example non-sensitive doc:
-    add_document(
-        content="Python is a popular programming language created by Guido van Rossum.",
-        is_sensitive=False,
-        metadata="General knowledge about Python"
-    )
-    # Example sensitive doc:
-    add_document(
-        content="CompanyXYZ's internal formula is: revenue_projection = (last_year_revenue * 1.12).",
-        is_sensitive=True,
-        metadata="Sensitive financial formula"
-    )
+    # Document Ingestion
+    st.subheader("Add a Document")
+    new_doc_text = st.text_area("Document content", "")
+    is_sensitive_flag = st.checkbox("Is this sensitive?", value=False)
+    metadata_text = st.text_input("Metadata (optional)")
 
-    print("Local documents in DB:")
-    for doc in retrieve_all_documents():
-        print(" -", doc)
+    if st.button("Add Document to DB"):
+        if new_doc_text.strip():
+            add_document(new_doc_text, is_sensitive=is_sensitive_flag, metadata=metadata_text)
+            st.success("Document added successfully!")
+        else:
+            st.warning("Document content is empty, please add some text.")
 
-    # Example user questions:
-    questions = [
-        "Tell me about Python's creator.",
-        "What is the latest info on NASA's Artemis program?",
-        "Show me the internal formula used by CompanyXYZ for revenue projection."
-    ]
+    # Q&A
+    st.subheader("Ask a Question")
+    user_question = st.text_input("Your question:")
+    if st.button("Ask"):
+        if user_question.strip():
+            answer = process_user_question(user_question)
+            st.write("**Answer:**", answer)
+        else:
+            st.warning("Please enter a question.")
 
-    for q in questions:
-        print(f"\nUser Question: {q}")
-        answer = process_user_question(q)
-        print("Assistant Answer:", answer)
+    # Debug info
+    if st.checkbox("Show all documents in DB"):
+        docs = retrieve_all_documents()
+        st.write(docs)
+
+
+if __name__ == "__main__":
+    main()
