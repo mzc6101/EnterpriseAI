@@ -16,7 +16,7 @@ EMBEDDING_MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
 embedding_model = SentenceTransformer(EMBEDDING_MODEL_NAME)
 dimension = 384  # Embedding dimension for the model
 similarity_threshold = 0.6
-
+PERPLEXITY_API_KEY = os.getenv("PERPLEXITY_API_KEY")
 OLLAMA_API_URL = "http://localhost:11434"
 OLLAMA_MODEL = "llama3.2:1b"
 CHATGPT_API_KEY =  os.getenv("CHATGPT_API_KEY")
@@ -124,6 +124,35 @@ def ask_ollama(prompt: str) -> str:
     response = requests.post(f"{OLLAMA_API_URL}/api/generate", json=req_body, headers={"Content-Type": "application/json"})
     return response.json().get("response", "Error: Ollama response failed.") if response.status_code == 200 else f"Error: {response.status_code}"
 
+#ask Perplexity
+def ask_perplexity(question: str) -> str:
+    """Query Perplexity API for internet-based answers."""
+    url = "https://api.perplexity.ai/chat/completions"
+    payload = {
+        "model": "sonar-pro",
+        "messages": [
+            {
+                "role": "system",
+                "content": "You are to find the latest information based on the question from the internet and relevant websites and provide a step by step detailed response."
+            },
+            {
+                "role": "user",
+                "content": question
+            }
+        ]
+    }
+    headers = {
+        "Authorization": f"Bearer {PERPLEXITY_API_KEY}",
+        "Content-Type": "application/json"
+    }
+    
+    try:
+        response = requests.post(url, json=payload, headers=headers)
+        if response.status_code == 200:
+            return response.json()['choices'][0]['message']['content']
+        return f"Error: Perplexity API request failed with status {response.status_code}"
+    except Exception as e:
+        return f"Error: Perplexity API request failed - {str(e)}"
 # Ask ChatGPT
 def ask_chatgpt(prompt: str) -> str:
     """Query ChatGPT with a prompt."""
@@ -137,38 +166,78 @@ def ask_chatgpt(prompt: str) -> str:
 
 # Process user question and route to appropriate model
 def process_question(question: str) -> tuple:
-    """Process the user's question and route it based on sensitivity."""
-    # Retrieve relevant documents
+    """Process the user's question with enhanced Perplexity integration."""
     relevant_docs = retrieve_relevant_docs(question, top_k=5)
-
-    # Split documents by sensitivity
     sensitive_docs = [doc for doc in relevant_docs if doc["is_sensitive"]]
     non_sensitive_docs = [doc for doc in relevant_docs if not doc["is_sensitive"]]
 
     if sensitive_docs:
-        # Prepare sensitive content and prompt Ollama
+        # Sensitive data flow
         sensitive_context = "\n\n".join(doc["content"] for doc in sensitive_docs)
-        prompt = f"""
-Context:
+        
+        # Step 1: Generate safe question for Perplexity
+        safe_q_prompt = f"""Context (DO NOT REPEAT IN OUTPUT):
 {sensitive_context}
 
-Based on the above context, answer this question: {question}
+Original question: {question}
 
-Answer only using the information provided in the context. Do not reference external sources or make assumptions. Provide a direct answer based strictly on the context, be concise in just one sentence, i dont need to know how you got it.
+Generate a safe question to ask the internet that helps answer the original question WITHOUT revealing any sensitive details from the context. The question should be general and technical, not mentioning specific implementations.
 """
+        safe_question = ask_ollama(safe_q_prompt)
         
-        answer = ask_ollama(prompt)
-        return "ollama", answer, prompt
+        # Step 2: Get Perplexity response
+        perplexity_response = ask_perplexity(safe_question)
+        
+        # Step 3: Process with ChatGPT
+        chatgpt_prompt = f"""Latest web information:
+{perplexity_response}
+
+Using this information, answer: {safe_question}
+"""
+        chatgpt_response = ask_chatgpt(chatgpt_prompt)
+        
+        # Step 4: Final answer with Ollama
+        final_prompt = f"""Sensitive Context (DO NOT SHARE):
+{sensitive_context}
+
+Web Research Summary:
+{chatgpt_response}
+
+Original Question: {question}
+
+Answer using both contexts without revealing sensitive details. Be concise and technical.
+"""
+        final_answer = ask_ollama(final_prompt)
+        return "ollama", final_answer, final_prompt
+
     elif non_sensitive_docs:
-        # Prepare non-sensitive content and prompt ChatGPT
-        non_sensitive_context = "\n\n".join(doc["content"] for doc in non_sensitive_docs)
-        prompt = f"Use the following content to answer the question:\n\n{non_sensitive_context}\n\nQuestion: {question}. be concise in just one sentence, i dont need to know how you got it"
+        # Non-sensitive flow with Perplexity enhancement
+        ns_context = "\n\n".join(doc["content"] for doc in non_sensitive_docs)
+        perplexity_response = ask_perplexity(question)
+        
+        chatgpt_prompt = f"""Local Document Context:
+{ns_context}
+
+Latest Web Information:
+{perplexity_response}
+
+Question: {question}
+Answer using both contexts as needed. Be concise.
+"""
+        answer = ask_chatgpt(chatgpt_prompt)
+        return "chatgpt", answer, chatgpt_prompt
+
     else:
-        # No relevant documents, ask ChatGPT without context
-        prompt = f"No relevant context found. Question: {question}"
-    
-    answer = ask_chatgpt(prompt)
-    return "chatgpt", answer, prompt
+        # No docs found - use Perplexity + ChatGPT
+        perplexity_response = ask_perplexity(question)
+        chatgpt_prompt = f"""Latest Web Information:
+{perplexity_response}
+
+Question: {question}
+Answer using the above information. Be concise.
+"""
+        answer = ask_chatgpt(chatgpt_prompt)
+        return "chatgpt", answer, chatgpt_prompt
 
 
 
