@@ -19,7 +19,7 @@ similarity_threshold = 0.6
 PERPLEXITY_API_KEY = os.getenv("PERPLEXITY_API_KEY")
 OLLAMA_API_URL = "http://localhost:11434"
 OLLAMA_MODEL = "llama3.2:1b"
-CHATGPT_API_KEY =  os.getenv("CHATGPT_API_KEY")
+CHATGPT_API_KEY = os.getenv("CHATGPT_API_KEY")
 OPENAI_MODEL = "gpt-4o"
 
 # Initialize FAISS
@@ -30,7 +30,6 @@ def init_db():
     """Initialize SQLite database and FAISS index."""
     global faiss_index
 
-    # Ensure SQLite database schema
     conn = sqlite3.connect(DATABASE_FILE)
     cursor = conn.cursor()
     cursor.execute("""
@@ -38,7 +37,8 @@ def init_db():
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             content TEXT NOT NULL,
             is_sensitive BOOLEAN NOT NULL DEFAULT 0,
-            metadata TEXT
+            metadata TEXT,
+            authorized_users TEXT  -- Store as a comma-separated string
         );
     """)
     conn.commit()
@@ -58,15 +58,14 @@ def save_faiss_index():
         faiss.write_index(faiss_index, FAISS_INDEX_FILE)
 
 # Add a document
-def add_document(content: str, is_sensitive: bool = False, metadata: str = ""):
+def add_document(content: str, is_sensitive: bool = False, metadata: str = "", authorized_users: str = ""):
     """Add a document to SQLite and FAISS index."""
-    # Insert into SQLite
     conn = sqlite3.connect(DATABASE_FILE)
     cursor = conn.cursor()
     cursor.execute("""
-        INSERT INTO documents (content, is_sensitive, metadata)
-        VALUES (?, ?, ?)
-    """, (content, 1 if is_sensitive else 0, metadata))
+        INSERT INTO documents (content, is_sensitive, metadata, authorized_users)
+        VALUES (?, ?, ?, ?)
+    """, (content, 1 if is_sensitive else 0, metadata, authorized_users))
     doc_id = cursor.lastrowid
     conn.commit()
     conn.close()
@@ -96,7 +95,7 @@ def retrieve_relevant_docs(query: str, top_k: int = 5):
     for idx, dist in zip(indices[0], distances[0]):
         if idx == -1 or dist < similarity_threshold:
             continue
-        cursor.execute("SELECT id, content, is_sensitive, metadata FROM documents WHERE id=?", (int(idx),))
+        cursor.execute("SELECT id, content, is_sensitive, metadata, authorized_users FROM documents WHERE id=?", (int(idx),))
         row = cursor.fetchone()
         if row:
             relevant_docs.append({
@@ -105,12 +104,14 @@ def retrieve_relevant_docs(query: str, top_k: int = 5):
                 "is_sensitive": bool(row[2]),
                 "metadata": row[3],
                 "similarity": dist,
+                "authorized_users": row[4].split(",") if row[4] else [],
             })
     conn.close()
 
     # Sort by similarity
     relevant_docs.sort(key=lambda x: x["similarity"], reverse=True)
     return relevant_docs
+
 
 # Ask Ollama
 def ask_ollama(prompt: str) -> str:
@@ -164,122 +165,116 @@ def ask_chatgpt(prompt: str) -> str:
     else:
         return f"Error: ChatGPT request failed with status code {response.status_code}, response: {response.text}"
 
-# Process user question and route to appropriate model
-def process_question(question: str) -> tuple:
-    """Process the user's question with enhanced Perplexity integration."""
+
+# Process user question and apply authorization check only on sensitive documents
+def process_question(question: str, user_id: str) -> tuple:
+    """Process the user's question while checking authorization for sensitive documents."""
     relevant_docs = retrieve_relevant_docs(question, top_k=5)
+
+    # Separate sensitive and non-sensitive docs
     sensitive_docs = [doc for doc in relevant_docs if doc["is_sensitive"]]
     non_sensitive_docs = [doc for doc in relevant_docs if not doc["is_sensitive"]]
 
+    # **Authorization Check for Sensitive Docs**
+    authorized_sensitive_docs = [
+        doc for doc in sensitive_docs if user_id in doc["authorized_users"]
+    ]
+
+    if sensitive_docs and not authorized_sensitive_docs:
+        return "Access Denied", "You are not authorized to view sensitive information.", "", ""
+
+    # **Proceed with processing using authorized sensitive + non-sensitive docs**
+    final_docs = authorized_sensitive_docs + non_sensitive_docs
+
     if sensitive_docs:
-        # Sensitive data flow
-        sensitive_context = "\n\n".join(doc["content"] for doc in sensitive_docs)
-        
-        # Step 1: Generate safe question for Perplexity
-        safe_q_prompt = f"""Context (DO NOT REPEAT IN OUTPUT):
-{sensitive_context}
+        context = "\n\n".join(doc["content"] for doc in relevant_docs)
 
-Original question: {question}
+        # Step 1: Generate a safe question
+        safe_q_prompt = f"""Context (DO NOT SHARE):
+{context}
 
-Generate a safe question to ask the internet that helps answer the original question WITHOUT revealing any sensitive details from the context. The question should be general and technical, not mentioning specific implementations.
+Original Question:
+{question}
+
+Your task:
+1. Identify general data points needed from external sources to answer the question.
+2. Frame a general question for external sources.
+
+IMPORTANT:
+- Do not repeat or share the context.
+- Do not include specific names, proprietary info, or direct references.
 """
         safe_question = ask_ollama(safe_q_prompt)
+
+        perp_question = f'{safe_question} (only provide required data points in two sentences)'
         
         # Step 2: Get Perplexity response
-        perplexity_response = ask_perplexity(safe_question)
-        
-        # Step 3: Process with ChatGPT
-        chatgpt_prompt = f"""Latest web information:
+        perplexity_response = ask_perplexity(perp_question)
+
+        # Step 3: Generate the final response
+        final_prompt = f""" Context (DO NOT SHARE):
+{context}
+
+Live Data Summary:
 {perplexity_response}
 
-Using this information, answer: {safe_question}
+Question:
+{question}
+
+Your task:
+1. Using the context and live data summary, answer the question concisely.
+2. Maintain clear spaces and indentation, max 50 words.
 """
-        chatgpt_response = ask_chatgpt(chatgpt_prompt)
-        
-        # Step 4: Final answer with Ollama
-        final_prompt = f"""Sensitive Context (DO NOT SHARE):
-{sensitive_context}
 
-Web Research Summary:
-{chatgpt_response}
-
-Original Question: {question}
-
-Answer using both contexts without revealing sensitive details. Be concise and technical.
-"""
         final_answer = ask_ollama(final_prompt)
-        return "ollama", final_answer, final_prompt
-
-    elif non_sensitive_docs:
-        # Non-sensitive flow with Perplexity enhancement
-        ns_context = "\n\n".join(doc["content"] for doc in non_sensitive_docs)
-        perplexity_response = ask_perplexity(question)
-        
-        chatgpt_prompt = f"""Local Document Context:
-{ns_context}
-
-Latest Web Information:
-{perplexity_response}
-
-Question: {question}
-Answer using both contexts as needed. Be concise.
-"""
-        answer = ask_chatgpt(chatgpt_prompt)
-        return "chatgpt", answer, chatgpt_prompt
+        return "on-device llm", final_answer, safe_question, perplexity_response
 
     else:
-        # No docs found - use Perplexity + ChatGPT
+        # No docs found - use Perplexity
         perplexity_response = ask_perplexity(question)
-        chatgpt_prompt = f"""Latest Web Information:
-{perplexity_response}
-
-Question: {question}
-Answer using the above information. Be concise.
-"""
-        answer = ask_chatgpt(chatgpt_prompt)
-        return "chatgpt", answer, chatgpt_prompt
-
-
-
-
-
-
+        return "advanced internet-based LLM", perplexity_response, "", ""
 
 # Streamlit frontend
 def main():
     init_db()
 
-    st.title("Document Storage and Q&A System")
+    st.title("Secure Document Storage & Q&A")
     st.subheader("Add Document")
     doc_content = st.text_area("Document Content")
     is_sensitive = st.checkbox("Mark as Sensitive")
     metadata = st.text_input("Metadata")
+    authorized_users = st.text_input("Authorized Users")
+
     if st.button("Add Document"):
         if doc_content.strip():
-            add_document(doc_content, is_sensitive, metadata)
+            add_document(doc_content, is_sensitive, metadata, authorized_users)
             st.success("Document added successfully.")
         else:
             st.warning("Document content cannot be empty.")
 
     st.subheader("Ask a Question")
+    user_id = st.text_input("Your ID")
     user_question = st.text_input("Your Question")
+    
     if st.button("Ask"):
         if user_question.strip():
-            model_name, answer, prompt = process_question(user_question)
+            model_name, answer, prompt1, prompt2 = process_question(user_question, user_id)
             st.write(f"**Model used:** {model_name}")
             st.write(f"**Answer:** {answer}")
-            st.write(f"**prompt:** {prompt}")
-
+            if prompt1: st.write(f"**Safe Question:** {prompt1}")
+            if prompt2: st.write(f"**Perplexity Prompt:** {prompt2}")
         else:
             st.warning("Please enter a question.")
-
     if st.checkbox("Show All Documents"):
+
         conn = sqlite3.connect(DATABASE_FILE)
         cursor = conn.cursor()
-        cursor.execute("SELECT id, content, is_sensitive, metadata FROM documents")
+        cursor.execute("SELECT id, content, is_sensitive, metadata, authorized_users FROM documents")
         docs = cursor.fetchall()
         conn.close()
         st.write(docs)
+        
 
 if __name__ == "__main__":
     main()
+
